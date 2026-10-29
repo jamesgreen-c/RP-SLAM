@@ -259,7 +259,30 @@ class GaussianDistParam(DistParam):
         return -0.5 * (
             self.params["mean"].shape[-1] * jnp.log(2.0 * jnp.pi) + logdet + inv_quad_form
         )
-    
+
+
+class DiagGaussianNatParam(NatParam):
+    """
+    Gaussian natural parameters, given by ['p', 'pwm'] = [A, A*m],
+    where A is the diagonal precision vector and m is the mean. 
+    The sufficient statistics are [-0.5*xx.T, x].
+    """
+    # p: Array
+    # pwm: Array
+
+    @property
+    def latent_dim(self):
+        return self.params['pwm'].shape[-1]
+
+    @property
+    @vmapping.auto_vmap('pwm', 1)
+    def dist_param(self):
+        precision = self.params["p"]
+        return GaussianDistParam(
+            mean=self.params["pwm"] / precision,
+            cov=1.0 / precision,
+        )
+
 
 @jax.tree_util.register_pytree_node_class
 class LGStationaryParam:

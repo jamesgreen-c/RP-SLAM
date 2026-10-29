@@ -87,7 +87,8 @@ class FreeEnergy:
         log_likelihood, kl_qp = self.get_loss_terms(prior_chains, gen_factors, posterior, observations)
 
         batch, times = posterior.params["means"].shape[:2]
-        Z = batch * times
+        obs_dim = observations[0].reshape(batch, times, -1).shape[-1]
+        Z = batch * times * obs_dim
         loss = -(log_likelihood - beta * kl_qp) / Z
 
         aux = {

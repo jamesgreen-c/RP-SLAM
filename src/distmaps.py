@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 
 from jax import Array
-from src.distributions import NatParam, GaussianNatParam
+from src.distributions import NatParam, GaussianNatParam, DiagGaussianNatParam
 
 
 EPS = 1e-3
@@ -115,3 +115,24 @@ class MVNCholeskyReLU(DistMap):
         p = L @ L.T + EPS * jnp.eye(self.latent_dim)
 
         return GaussianNatParam(p=p, pwm=pwm)
+
+
+class MVNDiagVector(DistMap):
+
+    def __init__(self, latent_dim: int, max_precision: float | None = None):
+        super().__init__(latent_dim)
+        if max_precision is not None and max_precision <= 0:
+            raise ValueError('max_precision must be positive.')
+        self.max_precision = max_precision
+
+    @property
+    def input_dim(self):
+        return self.latent_dim * 2
+    
+    def __call__(self, x: Array) -> GaussianNatParam:
+        pwm = x[:self.latent_dim]
+        p = nn.softplus(x[self.latent_dim:])
+        if self.max_precision is not None:
+            p = self.max_precision * nn.tanh(p / self.max_precision)
+        
+        return DiagGaussianNatParam(p=p, pwm=pwm)
