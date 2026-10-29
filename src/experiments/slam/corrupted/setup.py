@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 
 from src import distmaps
-from src.rp_slam import distributions
+from src import distributions
 from src.rp_slam.recognition import rpm
 from src.rp_slam.free_energy import rpm_fe
 from src.rp_slam.config import Config
