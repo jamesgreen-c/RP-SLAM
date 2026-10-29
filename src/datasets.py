@@ -174,6 +174,23 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
             params=None
         )
 
+    elif name == 'uninformative':
+            
+        BASE_DIR = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "slam" / "data").is_dir())
+        data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
+
+        latents = np.load(os.path.join(data_dir, "latents.npy"))
+        observations = np.load(os.path.join(data_dir, "uninformative_greyscale_images.npy")).astype(np.float32) / 255.0
+        observations = observations[:, :, 18:42, :]
+
+        return Dataset(
+            train_data=(observations[:200], ),
+            train_states=latents[:200],
+            val_data=(observations[200:], ),
+            val_states=latents[200:],
+            params=None
+        )
+
     else:
         raise NotImplementedError
 
