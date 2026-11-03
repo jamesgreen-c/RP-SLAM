@@ -5,8 +5,10 @@ from src.rp_slam.config import Config as RPConfig
 from src.rp_slam.free_energy import rpm_fe, ramp_fe
 from src.rp_slam.recognition import rpm, ramp
 from src.svae_slam.config import Config as SVAEConfig
-from src.svae_slam import svae_fe, svae
-
+from src.svae_slam.model import svae
+from src.svae_slam.free_energy import svae_fe
+from src.svae_slam.model import ramp_svae
+from src.svae_slam.free_energy import ramp_svae_fe
 
 def setup(
     kernel: str,
@@ -19,11 +21,11 @@ def setup(
     dec_lr: float = 1e-4,
     obs_dim: int = None
 ):
-    if kernel not in {"ramp", "rpssm", "svae"}:
+    if kernel not in {"ramp", "rpssm", "svae", "ramp-svae"}:
         raise NotImplementedError(f"{kernel} not implemented in setup.py")
 
     D = latent_dim
-    Config = SVAEConfig if kernel == "svae" else RPConfig
+    Config = SVAEConfig if (kernel == "svae" or kernel == "ramp-svae") else RPConfig
 
     CFG = Config(
         num_iter=num_iter,
@@ -63,7 +65,7 @@ def setup(
         MODEL = rpm.RPSSM(prior=PRIOR, recognition=(REC,))
         MODEL_FE = rpm_fe.ConstrainedIVFreeEnergy(model=MODEL)
 
-    else:
+    elif kernel == "svae":
         CFG.stabilise_A = "clip"
         CFG.generation.lr = dec_lr
 
@@ -82,5 +84,24 @@ def setup(
             generation=(DEC,),
         )
         MODEL_FE = svae_fe.FreeEnergy(model=MODEL)
+
+    else:
+        RPM = rpm.GaussianRecognition(
+            network=networks.TanhMLP([128]),
+            dist_map=distmaps.MVNCholeskySoftplus(D),
+            constant_cov=True,
+        )
+        DEC = rpm.GaussianRecognition(
+            network=networks.MLP([256, 256, 256]),
+            dist_map=distmaps.MVNCholeskySoftplus(obs_dim),
+            constant_cov=True,
+        )
+        MODEL = ramp_svae.RAMPSVAE(
+            latent_dim=D,
+            recognition=(REC,),
+            generation=(DEC,),
+            message_network=RPM,
+        )
+        MODEL_FE = ramp_svae_fe.FreeEnergy(model=MODEL)
 
     return CFG, MODEL_FE

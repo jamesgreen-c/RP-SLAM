@@ -117,7 +117,7 @@ class ConstrainedIVFreeEnergy:
         messages_by_time = tree_map(lambda x: jnp.moveaxis(x, 2, 0), messages)
         q_by_time = tree_map(lambda x: jnp.swapaxes(x, 0, 1), q)
 
-        # Evaluate pairwise Gaussian products separately at each time node.
+        # evaluate pairwise Gaussian products separately at each time node.
         def node_terms(inputs):
             messages, node_q = inputs
             return self._node_loss_terms(prior, messages, node_q)

@@ -1,13 +1,14 @@
 import jax.numpy as jnp
 
-from src import distmaps
-from src.rp_slam import distributions
-from src.rp_slam.recognition import rpm
-from src.rp_slam.free_energy import rpm_fe
-from src.rp_slam.config import Config
-from src.rp_slam.free_energy import ramp_fe
-from src.rp_slam.recognition import ramp
-from src import networks
+from src import distmaps, distributions, networks
+from src.rp_slam.config import Config as RPConfig
+from src.rp_slam.free_energy import rpm_fe, ramp_fe
+from src.rp_slam.recognition import rpm, ramp
+from src.svae_slam.config import Config as SVAEConfig
+from src.svae_slam.model import svae
+from src.svae_slam.free_energy import svae_fe
+from src.svae_slam.model import ramp_svae
+from src.svae_slam.free_energy import ramp_svae_fe
 
 
 def setup(
@@ -17,9 +18,15 @@ def setup(
     num_iter: int,
     seed: int,
     prior_lr: float = 1e-3,
-    rec_lr: float = 1e-3
+    rec_lr: float = 1e-3,
+    dec_lr: float = 1e-3,
+    obs_dim: int = None
 ):
+    if kernel not in {"ramp", "rpssm", "svae", "ramp-svae"}:
+        raise NotImplementedError(f"{kernel} not implemented in setup.py")
+
     D = latent_dim
+    Config = SVAEConfig if (kernel == "svae" or kernel == "ramp-svae") else RPConfig
 
     CFG = Config(
         num_iter=num_iter,
@@ -27,23 +34,20 @@ def setup(
         jit=True,
         seed=seed,
     )
-
-    # learning rates
     CFG.prior.lr = prior_lr
     CFG.recognition.lr = rec_lr
 
     REC = rpm.GaussianRecognition(
-        network=networks.MLP([256, 256]),
+        network=networks.MLP([256, 256, 256]),
         dist_map=distmaps.MVNCholeskySoftplus(D),
         constant_cov=True,
     )
 
-    # model definition
     if kernel == "ramp":
         RPM = rpm.GaussianRecognition(
-            network=networks.TanhMLP([128, 128]),
+            network=networks.TanhMLP([128]),
             dist_map=distmaps.MVNCholeskySoftplus(D),
-            constant_cov=True
+            constant_cov=True,
         )
         MODEL = ramp.RAMPSSM(
             latent_dim=D,
@@ -52,17 +56,53 @@ def setup(
         )
         MODEL_FE = ramp_fe.ConstrainedIVFreeEnergy(model=MODEL)
 
-    else:
+    elif kernel == "rpssm":
         CFG.stabilise_A = "clip"
-        
-        # Match the existing RPSSM prior initialisation.
+
         PRIOR = distributions.LGStationaryParam(
-            stationary=True, 
-            A=0.5*jnp.eye(D), 
+            stationary=True,
+            A=0.5 * jnp.eye(D),
         )
         MODEL = rpm.RPSSM(prior=PRIOR, recognition=(REC,))
         MODEL_FE = rpm_fe.ConstrainedIVFreeEnergy(model=MODEL)
 
+    elif kernel == "svae":
+        CFG.stabilise_A = "clip"
+        CFG.generation.lr = dec_lr
+
+        DEC = rpm.GaussianRecognition(
+            network=networks.MLP([256, 256, 256]),
+            dist_map=distmaps.MVNCholeskySoftplus(obs_dim),
+            constant_cov=True,
+        )
+        PRIOR = distributions.LGStationaryParam(
+            stationary=True,
+            A=0.5 * jnp.eye(D),
+        )
+        MODEL = svae.SVAE(
+            prior=PRIOR,
+            recognition=(REC,),
+            generation=(DEC,),
+        )
+        MODEL_FE = svae_fe.FreeEnergy(model=MODEL)
+
+    else:
+        RPM = rpm.GaussianRecognition(
+            network=networks.TanhMLP([128]),
+            dist_map=distmaps.MVNCholeskySoftplus(D),
+            constant_cov=True,
+        )
+        DEC = rpm.GaussianRecognition(
+            network=networks.MLP([256, 256, 256]),
+            dist_map=distmaps.MVNCholeskySoftplus(obs_dim),
+            constant_cov=True,
+        )
+        MODEL = ramp_svae.RAMPSVAE(
+            latent_dim=D,
+            recognition=(REC,),
+            generation=(DEC,),
+            message_network=RPM,
+        )
+        MODEL_FE = ramp_svae_fe.FreeEnergy(model=MODEL)
 
     return CFG, MODEL_FE
-
