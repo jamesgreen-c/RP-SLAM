@@ -16,7 +16,7 @@ from src.distributions import LGChainDistParam, GaussianDistParam
 from src.utils.math import inv_quad_form
 
 
-def _lgssm_params(prior, factors):
+def _lgssm_params(prior, factors, actions = None):
     """Build an unbatched Dynamax model with constant transition bias b.
 
     factors has mean=(T,D), cov=(T,D,D). The prior supplies m1, Q1, A, Q, b.
@@ -24,6 +24,12 @@ def _lgssm_params(prior, factors):
     """
     _, dim = factors.params['mean'].shape
     dtype = factors.params['mean'].dtype
+
+    bias = prior.params["b"]
+    if prior.action_conditioned:
+        transition_bias = bias + actions @ prior.params["B"].T
+        bias = jnp.concatenate([bias[None], transition_bias], axis=0)
+
     return make_lgssm_params(
         prior.params['m1'],
         prior.params['Q1'],
@@ -31,7 +37,7 @@ def _lgssm_params(prior, factors):
         prior.params['Q'],
         jnp.eye(dim, dtype=dtype),
         factors.params['cov'],
-        dynamics_bias=prior.params['b'],
+        dynamics_bias=bias,
         emissions_bias=jnp.zeros(dim, dtype=dtype),
     )
 
@@ -60,14 +66,14 @@ def parallel_filter(prior, factors):
     return _filter_distribution(prior, factors, output)
 
 
-def parallel_smoother(prior, factors):
+def parallel_smoother(prior, factors, actions=None):
     """Return (LGChainDistParam posterior, GaussianDistParam filtered).
 
     The smoothing chain has means=(T,D), covs=(T,D,D), and
     cross_covs=(T-1,D,D), oriented as Cov(z_{t+1},z_t).
     Filtered marginals reuse the forward output from Dynamax's smoother.
     """
-    params = _lgssm_params(prior, factors)
+    params = _lgssm_params(prior, factors, actions)
     output = parallel_lgssm_smoother(params, factors.params['mean'])
 
     A = prior.params['A']
