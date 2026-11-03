@@ -75,6 +75,13 @@ def gaussian_kl_precision(pq, hq, pp, hp):
     return vmap(_gaussian_kl_precision)(*arrays).reshape(shape)
 
 
+def gaussian_kl(q, p):
+    return gaussian_kl_precision(
+        q.params['p'], q.params['pwm'],
+        p.params['p'], p.params['pwm'],
+    )
+
+
 def scale_sv(A, eps):
     """
     Given a matrix A, scale its singular values to <=1-EPS.
