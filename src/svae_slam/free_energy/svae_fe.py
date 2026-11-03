@@ -9,7 +9,7 @@ from typing import Any
 from jax import vmap, Array
 
 from src.svae_slam.config import Config
-from src.svae_slam.svae import SVAE
+from src.svae_slam.model.svae import SVAE
 from src.utils.kalman import parallel_smoother
 from src.distributions import AllParam
 
