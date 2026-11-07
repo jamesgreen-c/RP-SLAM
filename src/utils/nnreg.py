@@ -1,58 +1,39 @@
-import optax
+"""Neural pose regression using centred windows of latent states."""
+
+from dataclasses import dataclass, replace
+from functools import partial
+import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import optax
 
-from typing import Callable, Any
-from tqdm import tqdm
-from dataclasses import dataclass
-
-from jax import Array, vmap
 from flax import linen as nn
+from scipy.ndimage import gaussian_filter1d
+from tqdm import tqdm
+from jax import Array
+from src.networks import MLP
+from src.utils.window import temporal_features
 
 
-###########################
-#     helper functions    #
-###########################
-
-def sse_loss(params, model, x, y):
-    """
-    Sum Squared Error from decoder on x (target) to y (data)
-    
-    Parameters
-    ----------
-    x: (B, T, D) - batch size, time steps, latent dimension
-    y: (B, T, K) - batch size, time steps, data dimension
-    
-    Returns
-    -------
-    sse:  Sum of the squared error of the NN to the targets
-    """
-
-    batched_apply = vmap(vmap(lambda _y: model.apply({'params': params}, _y)))
-    preds = batched_apply(y)
-    return jnp.sum((preds - x)**2), preds
+def _scaler(x):
+    mean = x.mean(axis=(0, 1), keepdims=True)
+    std = x.std(axis=(0, 1), keepdims=True)
+    return mean, jnp.where(std > 1e-8, std, 1.0)
 
 
-###########################
-#          config         #
-###########################
 @dataclass
 class Config:
-    batch_size: int
-    iterations: int
-    seed: int
-
+    batch_size: int = 32
+    iterations: int = 5000
+    seed: int = 1234
     lr: float = 1e-3
-    patience: int = 100
-
+    patience: int = 500
+    window: int = 11
     use_pbar: bool = True
 
-
-###########################
-#         decoder         #
-###########################
 
 class DecoderNetwork(nn.Module):
     """ Project any input dimension to target dimension with NN"""
@@ -66,172 +47,171 @@ class DecoderNetwork(nn.Module):
         return x
 
 
+def mse_loss(params, model, targets, inputs):
+    preds = model.apply({"params": params}, inputs)
+    return jnp.mean((preds - targets) ** 2)
+
+
+# def mse_loss(params, model, targets, inputs, temporal_weight=0.1):
+#     "Encourage smoothness"
+#     preds = model.apply({"params": params}, inputs)
+
+#     position_loss = jnp.mean((preds - targets) ** 2)
+
+#     pred_steps = jnp.diff(preds, axis=1)
+#     true_steps = jnp.diff(targets, axis=1)
+#     temporal_loss = jnp.mean((pred_steps - true_steps) ** 2)
+
+#     return position_loss + temporal_weight * temporal_loss
+
+
 class DecoderTrainer:
 
-    opt_state: optax.OptState
-    opts: optax.GradientTransformation
-    itr: int
-
     def __init__(
-            self,
-            model: DecoderNetwork,
-            config: Config,
-            logger: Callable = lambda *x: {}
-    ):
+            self, 
+            model: DecoderNetwork, 
+            config: Config
+        ):
         self.model = model
         self.config = config
-        self.logger = logger
 
-    def train_step(self, params, opt_state: optax.OptState, x: Array, y: Array) -> tuple[float, Any, optax.OptState]:
+    def train_step(self, params, opt_state, targets, inputs):
+        loss_fn = partial(mse_loss, model=self.model, targets=targets, inputs=inputs)
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        updates, opt_state = self.opt.update(grads, opt_state, params)
+        return loss, optax.apply_updates(params, updates), opt_state
+
+    def fit(self, x, y, val_x, val_y):
         """
+        Fit targets x from latents y, each shaped (sequences, time, features).
 
-        Parameters
-        ----------
-        x: (B, T, D) - targets
-        y: (B, T, K) - data where K >= D
-
-        Returns
-        -------
-        loss:           sse of the current NN projection error
-        new_param:      new NN params after SGD update
-        new_opt_state:  new NN optimizer state after SGD update
-        pred:           current projections from data to target space
+        Pass raw latents. Windows and scaling are fitted here. Validation is
+        checked every iteration, and the best parameters are restored.
         """
-        
-        (loss, pred), grad = jax.value_and_grad(sse_loss, has_aux=True)(params, self.model, x, y)
-        updates, new_opt_state = self.opt.update(grad, opt_state, params)
-        new_param = optax.apply_updates(params, updates)
-
-        return loss, new_param, new_opt_state, pred
-
-    def fit(self, x: Array, y: Array, val_x: Array | None = None, val_y: Array | None = None) -> None:
-        """
-        Fit the decoder model to the target x and data y.
-        
-        Parameters
-        ----------
-            x:      (N, T, D) - targets
-            y:      (N, T, K) - data
-            val_x:  (S, T, D) - validation targets
-            val_y:  (S, T, K) - validation data
-        """
-
-        N, T = x.shape[:2]
-        print(f'Training Decoder with N={N}, T={T}')
-
+        config = self.config
         train_step = jax.jit(self.train_step)
+        evaluate = jax.jit(partial(mse_loss, model=self.model))
 
-        # initialisation        
-        key, subkey = jr.split(jr.PRNGKey(self.config.seed))
-        self.params = self.model.init(key, y[0, 0])['params']
+        # make windowed sequences and standardise
+        y = temporal_features(y, config.window)
+        val_y = temporal_features(val_y, config.window)
+        x, y, val_x, val_y = self._standardise(x, y, val_x, val_y)
 
-        self.opt = optax.adam(self.config.lr)
-        self.opt_state = self.opt.init(self.params)
+        # initialisation
+        key, init_key = jr.split(jr.PRNGKey(config.seed))
+        self.params = self.model.init(init_key, y[0, 0])["params"]
+
+        self.opt = optax.adam(config.lr)
+        opt_state = self.opt.init(self.params)
         
         # stores
-        best_val_loss = jnp.inf
-        best_params = None
+        best_loss = float("inf")
+        best_params = self.params
         wait = 0
         self.loss_tot = []
-        self.val_loss_tot = [] 
+        self.val_loss_tot = []
 
-        # batching function
-        _batcher = self._batching(self.config.batch_size, N)
-
-        # run training
-        pbar = tqdm(range(self.config.iterations), disable=not(self.config.use_pbar))
+        # run training        
+        batch_size = min(config.batch_size, len(y))
+        pbar = tqdm(range(config.iterations), disable=not config.use_pbar)
         for self.itr in pbar:
 
-            # batch
-            key, subkey = jr.split(key)
-            batch_indices = _batcher(subkey)
-            batch_x = x[batch_indices]
-            batch_y = y[batch_indices]
-
+            # batching
+            key, batch_key = jr.split(key)
+            indices = jr.choice(batch_key, len(y), (batch_size,), replace=False)
+            
             # train step
-            loss, self.params, self.opt_state, pred = train_step(self.params, self.opt_state, batch_x, batch_y)
+            loss, self.params, opt_state = train_step(
+                self.params, opt_state, x[indices], y[indices]
+            )
 
             # loss logging
-            loss = loss / (N * T)
-            self.loss_tot.append(loss)
-            to_print = self.logger(self, batch_indices)
-            to_print.update({'loss': f'{loss:.3f}'})
+            val_loss = float(evaluate(self.params, targets=val_x, inputs=val_y))
+            self.loss_tot.append(float(loss))
+            self.val_loss_tot.append(val_loss)
+            pbar.set_postfix(loss=f"{float(loss):.4f}", val_loss=f"{val_loss:.4f}")
 
-            if val_x is not None and val_y is not None:
-                val_loss, _ = sse_loss(self.params, self.model, val_x, val_y)
-                self.val_loss_tot.append(val_loss)
-                
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_params = self.params
-                    wait = 0
-                
-                else:
-                    wait += 1
-
-            if wait >= self.config.patience:
-                self.params = best_params
-                pbar.n = pbar.total
-                pbar.refresh()  
-                jax.debug.print(f'Early stopping at iteration {self.itr} with best validation loss {best_val_loss:.3f}')
+            # checks
+            if not np.isfinite(float(loss)) or not np.isfinite(val_loss):
+                raise FloatingPointError("Neural regression loss became non-finite.")
+            
+            if val_loss < best_loss:
+                best_loss, best_params, wait = val_loss, self.params, 0
+            else:
+                wait += 1
+            
+            if wait >= config.patience:
                 break
 
-            pbar.set_postfix(**to_print)
+        # pbar.close()
+        self.params = best_params
+        return self
 
-    def _batching(self, batch_size, N):
-        if batch_size >= N:
-            print("Using entire dataset")
-            batcher = lambda _: jnp.arange(N)
-            return batcher
+    def apply(self, params, y):
+        """Decode raw latents shaped (B,T,D) or (T,D) in original pose units."""
+        y = temporal_features(y, self.config.window)
+        mean = self.input_mean.reshape(-1)
+        std = self.input_std.reshape(-1)
+        preds = self.model.apply({"params": params}, (y - mean) / std)
+        return preds * self.target_std.reshape(-1) + self.target_mean.reshape(-1)
+
+    def predict(self, y):
+        return self.apply(self.params, y)
+
+    def _standardise(self, x, y, val_x, val_y):
         
-        batcher = lambda _k: jr.randint(_k, (batch_size, ), 0, N)
-        return batcher
+        self.input_mean, self.input_std = _scaler(y)
+        self.target_mean, self.target_std = _scaler(jnp.asarray(x))
 
-    def apply(self, params, y: Array) -> Array:
-        """
-        Apply the decoder model to the input y.
+        y = (y - self.input_mean) / self.input_std
+        val_y = (val_y - self.input_mean) / self.input_std
 
-        Parameters
-        ---------
-        y:       (B, T, D) or (T, D) the set of (or singular) timeseries to apply the decoder to
-        params:  model parameters
-        
-        Returns
-        -------
-        preds:  Projection of the input y to target space
-        """
-        assert y.ndim in (2, 3), "Data must be of shape (B, T, D) or (T, D)"
+        x = (jnp.asarray(x) - self.target_mean) / self.target_std
+        val_x = (jnp.asarray(val_x) - self.target_mean) / self.target_std
 
-        _apply = vmap(lambda _y: self.model.apply({"params": params}, _y))
-        _apply = vmap(_apply) if y.ndim == 3 else _apply
-        return _apply(y)
-        
+        return x, y, val_x, val_y
 
 
+def neural_regression(
+    x,
+    val_x,
+    train_states,
+    val_states,
+    config,
+    plot=True,
+    smoothing_sigma=1.5,
+    hidden_dims=(256, 256),
+):
+    """
+    Return (trainer, raw_predictions, smoothed_predictions).
 
-# def get_posterier_train_state_means(
-#         data,
-#         trainer: Trainer,
-#         seq_idx: int | None = None
-# ):
-#     """
-    
-#     Extract all the posterior means from the training data for 
-#     the higher dimensional latent states. If `seq_idx` is provided,
-#     it will compute the posterior means for that specific sequence index.
-#     """
-#     data = data.standardised_data
+    x and val_x are raw (N,T,D) latents. Targets are (N,T,K) poses.
+    window is the total width, including the centre frame.
+    smoothing_sigma=None disables the optional Gaussian filter.
+    """
 
-#     if seq_idx is None:
-#         ts_means = jax.vmap(
-#             lambda i: trainer.apply(
-#                 (data.train_data[0][None, i],)
-#             )[1].params["means"][0]
-#         )(jnp.arange(data.train_data[0].shape[0]))
-        
-#     else:
-#         sequence = data.train_data[0][None, seq_idx]
-#         _, ts_posterior = trainer.apply((sequence,))
-#         ts_means = ts_posterior.params['means'][0]
-    
-#     return ts_means
+    # fit neural regression
+    model = DecoderNetwork(MLP(tuple(hidden_dims)), train_states.shape[-1])
+    trainer = DecoderTrainer(model, config)
+    trainer.fit(train_states, x, val_states, val_x)
+
+    preds_raw = trainer.predict(val_x)
+    preds_smooth = preds_raw
+    if smoothing_sigma is not None:
+        preds_smooth = jnp.asarray(gaussian_filter1d(
+            np.asarray(preds_raw), 
+            sigma=smoothing_sigma, 
+            axis=1
+        ))
+
+    if plot:
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(trainer.loss_tot, label="Training")
+        ax.plot(trainer.val_loss_tot, label="Validation")
+        ax.set(xlabel="Iteration", ylabel="Mean squared error (standardised poses)")
+        ax.legend()
+        fig.tight_layout()
+        plt.show()
+
+    return trainer, preds_raw, preds_smooth
