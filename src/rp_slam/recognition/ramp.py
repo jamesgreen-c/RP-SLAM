@@ -67,6 +67,7 @@ class RAMPSSM:
         latent_dim: int,
         recognition: Sequence[GaussianRecognition],
         message_network: GaussianRecognition,
+        action_conditioned: bool = False
     ):
         if latent_dim < 1 or not recognition:
             raise ValueError('Use positive dimensions and at least one recogniser.')
@@ -75,6 +76,7 @@ class RAMPSSM:
         self.recognition = tuple(recognition)
         self.message_network = message_network
         self.prior = GaussianNatParam(p=jnp.eye(latent_dim), pwm=jnp.zeros(latent_dim))
+        self.action_conditioned = action_conditioned
 
     def _data(self, data) -> tuple[Array, ...]:
         data = tuple(data) if isinstance(data, (tuple, list)) else (data,)
@@ -90,35 +92,33 @@ class RAMPSSM:
         
         return data
 
-    def _message(self, params, ratio: GaussianNatParam):
-        """
-        Encode a batch of cavity ratios and apply the existing Gaussian head.
+    def _actions(self, actions, data):
+        """Validate actions shaped (B, T - 1, action_dim), or return None."""
+        if actions is None:
+            if self.action_conditioned:
+                raise ValueError("Actions are required when action conditioning is enabled.")
+            return None
 
-        The prior is implicit and fixed. The cavity belief is prior + ratio.
-        Only the precision's lower triangle is needed because it is symmetric.
-        DistMap acts on one example, hence the vmap over the batch.
+        if not self.action_conditioned:
+            raise ValueError("Actions were supplied, but action conditioning is disabled.")
 
-        Parameters
-        ----------
-        params: Parameters of one directed message network.
-        ratio:  Cavity ratio with pwm=(B,N), p=(B,N,N).
+        actions = jnp.asarray(actions)
+        batch, times = data[0].shape[:2]
 
-        Returns
-        -------
-        output: Outgoing ratios with pwm=(B,N), p=(B,N,N). 
-                    The intermediate network features have shape (B,F).
-        """
-        rows, cols = jnp.tril_indices(self.latent_dim)
-        features = jnp.concatenate((
-            ratio.params['pwm'],
-            ratio.params['p'][..., rows, cols],
-        ), axis=-1)
-        return vmap(lambda x: self.message_network.apply(params, x))(features)
+        if (actions.ndim != 3 or actions.shape[:2] != (batch, times - 1) or actions.shape[-1] < 1):
+            raise ValueError(
+                "Expected actions with shape "
+                f"({batch}, {times - 1}, action_dim), "
+                f"with action_dim >= 1; got {actions.shape}."
+            )
 
-    def init(self, key: Array, data, config: Config) -> dict:
+        return actions
+
+    def init(self, key: Array, data, config: Config, actions=None) -> dict:
         """Use the same model-init signature and optimizer groups as RPSSM."""
 
         data = self._data(data)
+        actions = self._actions(actions, data)
         count = len(self.recognition)
         keys = jr.split(key, count + 2)
 
@@ -127,7 +127,8 @@ class RAMPSSM:
 
         # nodewise rpm params
         input_dim = self.latent_dim + self.latent_dim * (self.latent_dim + 1) // 2
-        dummy = jnp.zeros(input_dim)
+        action_dim = 0 if actions is None else actions.shape[-1]
+        dummy = jnp.zeros(input_dim + action_dim)
         prior_params = {
             'forward': self.message_network.init(keys[count], dummy),
             'backward': self.message_network.init(keys[count + 1], dummy),
@@ -158,7 +159,33 @@ class RAMPSSM:
         factors = type(outs[0])(**{k: jnp.stack([out.params[k] for out in outs]) for k in outs[0].params.keys()})
         return factors
 
-    def _pass(self, params, local, reverse=False) -> GaussianNatParam:
+    def _message(self, params, ratio: GaussianNatParam, action: Array | None = None):
+        """
+        Encode a batch of cavity ratios and apply the existing Gaussian head.
+
+        The prior is implicit and fixed. The cavity belief is prior + ratio.
+        Only the precision's lower triangle is needed because it is symmetric.
+        DistMap acts on one example, hence the vmap over the batch.
+
+        Parameters
+        ----------
+        params: Parameters of one directed message network.
+        ratio:  Cavity ratio with pwm=(B,N), p=(B,N,N).
+
+        Returns
+        -------
+        output: Outgoing ratios with pwm=(B,N), p=(B,N,N). 
+                    The intermediate network features have shape (B,F).
+        """
+        rows, cols = jnp.tril_indices(self.latent_dim)
+
+        pwm = ratio.params["pwm"]
+        p = ratio.params['p'][..., rows, cols]
+        feats = (pwm, p, action) if self.action_conditioned else (pwm, p) 
+        features = jnp.concatenate(feats, axis=-1)
+        return vmap(lambda x: self.message_network.apply(params, x))(features)
+
+    def _pass(self, params, local, reverse=False, actions: Array | None = None) -> GaussianNatParam:
         """
         Send messages along the chain without feeding a message back to its sender.
 
@@ -179,23 +206,30 @@ class RAMPSSM:
             The last time is zero for a backward pass.
         """
         zero = tree_map(lambda x: jnp.zeros_like(x[:, 0]), local)
+
+        # a single node has no incoming chain messages.
+        if local.params["pwm"].shape[1] == 1:
+            return tree_map(lambda x: x[:, None], zero)
+
         source_slice = slice(1, None) if reverse else slice(None, -1)
         sites = tree_map(lambda x: jnp.swapaxes(x[:, source_slice], 0, 1), local)
+        actions = None if actions is None else jnp.swapaxes(actions, 0, 1)
 
-        def step(incoming, site):
-            outgoing = self._message(params, incoming + site)
+        def step(incoming, inputs):
+            site, action = inputs
+            outgoing = self._message(params, incoming + site, action)
             return outgoing, outgoing
 
-        _, outgoing = lax.scan(step, zero, sites, reverse=reverse)
+        _, outgoing = lax.scan(step, zero, (sites, actions), reverse=reverse)
         outgoing = tree_map(lambda x: jnp.swapaxes(x, 0, 1), outgoing)
 
         def pad(message, empty):
-            parts = (message, empty[:, None]) if reverse else (empty[:, None], message)
+            parts = ((message, empty[:, None]) if reverse else (empty[:, None], message))
             return jnp.concatenate(parts, axis=1)
 
         return tree_map(pad, outgoing, zero)
 
-    def get_messages(self, prior_params, factors_nat) -> GaussianNatParam:
+    def get_messages(self, prior_params, factors_nat, actions=None) -> GaussianNatParam:
         """
         Stack observation, left and right ratios at every latent node.
 
@@ -215,8 +249,8 @@ class RAMPSSM:
             The first J branches are observations, followed by left and right.
         """
         local = factors_nat.sum(axis=0)
-        left = self._pass(prior_params['forward'], local)
-        right = self._pass(prior_params['backward'], local, reverse=True)
+        left = self._pass(prior_params['forward'], local, actions=actions)
+        right = self._pass(prior_params['backward'], local, reverse=True, actions=actions)
         return tree_map(
             lambda obs, past, future: jnp.concatenate((obs, past[None], future[None]), axis=0),
             factors_nat, left, right,

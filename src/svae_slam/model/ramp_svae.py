@@ -1,14 +1,4 @@
-"""RAMP node inference with one generative decoder per observation modality.
-
-Place this file at ``src/svae_slam/ramp_svae.py``. The inherited RAMPSSM
-implements recognition and both message passes without modification. There
-is no generative transition density: ``prior`` remains the fixed N(0, I)
-node prior, and the learnable ``prior`` group holds the message networks.
-
-Parameter groups follow SVAE: ``prior`` (messages), ``rec`` (recognition),
-and ``gen`` (decoders). Decoders return observation NatParams, including
-DiagGaussianNatParam for image likelihoods with diagonal precision.
-"""
+"""RAMP node inference with one generative decoder per observation modality."""
 
 from typing import Sequence
 
@@ -32,13 +22,14 @@ class RAMPSVAE(RAMPSSM):
     """
 
     def __init__(
-            self,
-            latent_dim: int,
-            recognition: Sequence[GaussianRecognition],
-            generation: Sequence[GaussianRecognition],
-            message_network: GaussianRecognition,
-        ):
-        super().__init__(latent_dim, recognition, message_network)
+        self,
+        latent_dim: int,
+        recognition: Sequence[GaussianRecognition],
+        generation: Sequence[GaussianRecognition],
+        message_network: GaussianRecognition,
+        action_conditioned: bool = False
+    ):
+        super().__init__(latent_dim, recognition, message_network, action_conditioned)
         self.generation = tuple(generation)
 
         if len(self.generation) != len(self.recognition):
@@ -49,9 +40,11 @@ class RAMPSVAE(RAMPSSM):
             key: Array,
             data: tuple[Array, ...] | Array,
             config: Config,
+            actions=None
         ) -> AllParams:
         """Initialise RAMP messages/recognisers and independent decoder trees."""
         data = self._data(data)
+        actions = self._actions(actions, data)
         J = len(data)
 
         prior_key, rec_key, gen_key = jr.split(key, 3)
@@ -64,7 +57,8 @@ class RAMPSVAE(RAMPSSM):
 
         # nodewise rpm params
         input_dim = self.latent_dim + self.latent_dim * (self.latent_dim + 1) // 2
-        dummy = jnp.zeros(input_dim)
+        action_dim = 0 if actions is None else actions.shape[-1]
+        dummy = jnp.zeros(input_dim + action_dim)
         prior_params = {
             'forward': self.message_network.init(prior_keys[0], dummy),
             'backward': self.message_network.init(prior_keys[1], dummy),

@@ -278,92 +278,174 @@ class DiagGaussianNatParam(NatParam):
     @vmapping.auto_vmap('pwm', 1)
     def dist_param(self):
         precision = self.params["p"]
-        return GaussianDistParam(
+        return DiagGaussianDistParam(
             mean=self.params["pwm"] / precision,
             cov=1.0 / precision,
         )
 
+    @property
+    def lognormalizer(self):
+        precision = self.params["p"]
+        return 0.5 * jnp.sum(self.params["pwm"] ** 2 / precision - jnp.log(precision), axis=-1)
+
+    def expsuffstat_dot(self, other):
+        precision = self.params["p"]
+        mean = self.params["pwm"] / precision
+        return jnp.sum(
+            mean * other.params["pwm"] - 0.5 * (1.0 / precision + mean ** 2) * other.params["p"],
+            axis=-1,
+        )
+
+
+class DiagGaussianDistParam(DistParam):
+    """mean and cov both have shape (..., D), with D the event dimension."""
+
+    @property
+    @vmapping.auto_vmap('mean', 1)
+    def nat_param(self):
+        precision = 1.0 / self.params["cov"]
+        return DiagGaussianNatParam(p=precision, pwm=precision * self.params["mean"])
+
+    def log_prob(self, x):
+        mean, variance = self.params["mean"], self.params["cov"]
+        terms = jnp.log(2.0 * jnp.pi) + jnp.log(variance) + (x - mean) ** 2 / variance
+        return -0.5 * jnp.sum(terms, axis=-1)
+
+    def sample(self, key, shape=()):
+        mean, variance = self.params["mean"], self.params["cov"]
+        noise = jax.random.normal(key, tuple(shape) + mean.shape, dtype=mean.dtype)
+        return mean + jnp.sqrt(variance) * noise
+
 
 @jax.tree_util.register_pytree_node_class
 class LGStationaryParam:
-    """Linear-Gaussian prior with p(z_1)=N(m1,Q1) and transitions N(Az+b,Q).
+    """Linear-Gaussian prior with optional action conditioning.
 
-    stationary=True fixes m1=0 and Q1=I; otherwise m1 and Q1 are learnable.
-    In both modes Q=Q1-A Q1 A.T and b=(I-A)m1 are derived to preserve
-    the initial marginal. These require a stable A and positive definite Q.
-    A supplied as a vector represents diagonal dynamics with sigmoid-mapped
-    learnable entries when update() is called.
+    Initial distribution:
+        z[0] ~ N(m1, Q1)
+
+    Transitions:
+        z[t + 1] ~ N(A @ z[t] + b + B @ actions[t], Q)
+
+    The action term is omitted when action_conditioned=False.
+
+    stationary=True fixes m1=0 and Q1=I; otherwise they are learnable.
+    In both modes:
+        Q = Q1 - A @ Q1 @ A.T
+        b = (I - A) @ m1
+
+    These preserve the initial marginal under zero actions, provided Q is
+    positive definite. Nonzero actions generally change the marginal mean.
     """
-    # A: Array
-    # b: Array
 
-    # TODO: if p(z_1) is invariant dist, don't do the recursion, just copy p(z_1) T times
-
-    def __init__(self, stationary: bool, **kwargs):
-        self.params = kwargs
+    def __init__(
+        self,
+        stationary: bool,
+        action_conditioned: bool = False,
+        **kwargs,
+    ):
+        self.params = dict(kwargs)
         self.stationary = stationary
-        dim = kwargs['A'].shape[0]
+        self.action_conditioned = action_conditioned
 
-        # when initialized at stationary distribution, WLOG assume m1=0, Q1=I
+        A = self.params["A"]
+        if A.ndim not in (1, 2):
+            raise ValueError("A must be a vector or a square matrix.")
+
+        dim = A.shape[0]
+        if A.ndim == 2 and A.shape != (dim, dim):
+            raise ValueError("A must be square.")
+
         if stationary:
             self.params.update(
-                {
-                    'm1': jnp.zeros(dim),
-                    'Q1': jnp.eye(dim)
-                }
+                m1=jnp.zeros(dim, dtype=A.dtype),
+                Q1=jnp.eye(dim, dtype=A.dtype),
             )
-            
-            self.opt_param = {'A': self.params['A']} # only learn A
+            self.opt_param = {"A": A}
         else:
             self.opt_param = {
-                'm1': self.params['m1'],
-                'Q1': self.params['Q1'],
-                'A': self.params['A']
+                "m1": self.params["m1"],
+                "Q1": self.params["Q1"],
+                "A": A,
             }
-            
-        # if A is given as a vector, reshape it to a diagonal matrix
-        if kwargs['A'].ndim == 1:
-            self.params.update({'A': jnp.diag(kwargs['A'])})
 
-        # enforce stability
+        # Keep the optimisable vector representation, but use a matrix
+        # for moment calculations.
+        if A.ndim == 1:
+            self.params["A"] = jnp.diag(A)
+
+        if action_conditioned:
+            if "B" not in self.params:
+                raise ValueError(
+                    "Action conditioning requires an action mixing matrix B."
+                )
+
+            B = self.params["B"]
+            if B.ndim == 1:
+                if B.shape != (dim,):
+                    raise ValueError(
+                        "A diagonal B must have shape (latent_dim,)."
+                    )
+                self.params["B"] = jnp.diag(B)
+            elif B.ndim != 2 or B.shape[0] != dim:
+                raise ValueError(
+                    "B must have shape (latent_dim, action_dim)."
+                )
+
+            self.opt_param["B"] = B
+
+        A = self.params["A"]
+        Q1 = self.params["Q1"]
+        m1 = self.params["m1"]
+
+        # Derive invariant dynamics; this does not itself enforce Q > 0.
         self.params.update(
-            {
-                'Q': self.params['Q1'] - self.params['A'] @ self.params['Q1'] @ self.params['A'].T,
-                'b': (jnp.eye(dim) - self.params['A']) @ self.params['m1']
-            }
+            Q=Q1 - A @ Q1 @ A.T,
+            b=(jnp.eye(dim, dtype=A.dtype) - A) @ m1,
         )
 
     @property
     def latent_dim(self):
-        return self.params['A'].shape[0]
-    
+        return self.params["A"].shape[0]
+
     def update(self, params):
         """Update an arbitrary number of parameters."""
-        new_params = {**self.params, **params} # jax-compatible update
-        # TODO: when not stationary, turn Q1 param into covariance
-        if new_params['A'].ndim == 1:
-            new_params['A'] = nn.sigmoid(new_params['A'])
-        return LGStationaryParam(stationary=self.stationary, **new_params)
-    
-    def to_chain(self, num_timesteps):
-        """Return prior chain moments for a positive number of timesteps."""
+        new_params = {**self.params, **params}
+
+        # Preserve the existing convention: vector A updates are logits.
+        if new_params["A"].ndim == 1:
+            new_params["A"] = nn.sigmoid(new_params["A"])
+
+        return LGStationaryParam(
+            stationary=self.stationary,
+            action_conditioned=self.action_conditioned,
+            **new_params,
+        )
+
+    def to_chain(self, num_timesteps, actions=None):
+        """Return prior chain moments.
+
+        actions[t] drives z[t] -> z[t + 1], with shape
+        (num_timesteps - 1, action_dim).
+        """
         if num_timesteps < 1:
-            raise ValueError('At least one timestep is required.')
-        # TODO: adjust if using p instead of Q
-        # NOTE: check older commits for a more general version of this function
-        # that allows for nonstationary and returning dynamics params
-        if self.stationary:
+            raise ValueError("At least one timestep is required.")
+
+        if self.stationary and not self.action_conditioned:
             means = jnp.tile(self.params['m1'][None], (num_timesteps, 1))
-            covs = jnp.tile(self.params['Q1'][None], (num_timesteps, 1, 1)) # TODO: check that this is the correct shape
+            covs = jnp.tile(self.params['Q1'][None], (num_timesteps, 1, 1))
             cross_covs = self.params['A'] @ covs[:-1] # Cov(z_t+1,z_t) = A @ Sigma_t
+
         else:
+
+            bs = jnp.tile(self.params['b'][None], (num_timesteps-1, 1))
+
+            if self.action_conditioned:
+                B = self.params["B"]
+                bs = bs + actions @ B.T
+
             As = jnp.tile(self.params['A'][None], (num_timesteps, 1, 1))
-            bs = jnp.concatenate(
-                [
-                    self.params['m1'][None],
-                    jnp.tile(self.params['b'][None], (num_timesteps-1, 1))
-                ]
-            )
+            bs = jnp.concatenate([self.params["m1"][None], bs], axis=0)
             Qs = jnp.concatenate(
                 [
                     self.params['Q1'][None],
@@ -377,21 +459,20 @@ class LGStationaryParam:
                 A2, b2, Q2 = elem2
                 return A2 @ A1, A2 @ b1 + b2, A2 @ Q1 @ A2.T + Q2
 
-            init_elems = (As, bs, Qs)
-            _, means, covs = jax.lax.associative_scan(recursion, init_elems)
-            cross_covs = As[1:] @ covs[:-1] # Cov(z_t+1,z_t) = A_t+1 @ Sigma_t
-        
+            _, means, covs = jax.lax.associative_scan(recursion, (As, bs, Qs))
+            cross_covs = As[1:] @ covs[:-1]
+
         return LGChainDistParam(means=means, covs=covs, cross_covs=cross_covs)
 
     def tree_flatten(self):
         leaves = list(self.params.values())
-        aux_data = (list(self.params.keys()), self.stationary)
+        aux_data = (list(self.params.keys()), self.stationary, self.action_conditioned)
         return leaves, aux_data
-    
+
     @classmethod
     def tree_unflatten(cls, aux_data, leaves):
-        param_keys, stationary = aux_data
-        return cls(stationary=stationary, **dict(zip(param_keys, leaves)))
+        param_keys, stationary, action_conditioned = aux_data
+        return cls(stationary=stationary, action_conditioned=action_conditioned, **dict(zip(param_keys, leaves)))
     
 
 class LGChainDistParam(DistParam):

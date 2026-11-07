@@ -26,11 +26,12 @@ class FreeEnergy:
             self,
             key: Array,
             data: tuple[Array, ...] | Array,
-            config: Config
+            config: Config,
+            actions: Array | None = None
         ) -> tuple[dict, dict[str, optax.OptState], dict[str, optax.GradientTransformation]]:
         self.configure(config)
 
-        params = self.model.init(key, data, config)
+        params = self.model.init(key, data, config, actions)
 
         opts = {
             "prior": config.prior.build(), 
@@ -40,8 +41,7 @@ class FreeEnergy:
         opt_states = {name: opts[name].init(params[name]) for name in opts}
         return params, opt_states, opts
 
-    def get_posterior(self, prior_params, rec_params, observations):
-
+    def get_posterior(self, prior_params, rec_params, observations, actions=None):
         """Return (prior_chains, factors, smoothed).
 
         Prior and smoothed chains have means=(B,T,N), covs=(B,T,N,N),
@@ -50,18 +50,25 @@ class FreeEnergy:
         """
         factors_nat = self.model.get_rec_factors(rec_params, observations)
         factors = AllParam(factors_nat.sum(axis=0)).dist_param
-        batch, times = factors.params['mean'].shape[:2]
 
+        batch, times = factors.params['mean'].shape[:2]
         prior = self.model.get_prior(prior_params)
-        prior_chains = vmap(lambda _: prior.to_chain(times))(jnp.arange(batch))
-        posterior = vmap(lambda f: parallel_smoother(prior, f))(factors)
+
+        if prior.action_conditioned:
+            prior_chains = vmap(lambda _acts: prior.to_chain(times, _acts))(actions)
+            posterior = vmap(lambda f, acts: parallel_smoother(prior, f, acts))(factors, actions)
+        else:
+            prior_chains = vmap(lambda _: prior.to_chain(times))(jnp.arange(batch))
+            posterior = vmap(lambda f: parallel_smoother(prior, f))(factors)
+
         return prior_chains, factors_nat, posterior
 
     def loss(
             self,
             params: dict,
-            observations: tuple[Array, ...] | Array,
             key: Array,
+            observations: tuple[Array, ...] | Array,
+            actions: Array | None = None,
             beta: float = 1.0,
             num_samples: int = 1,
         ) -> tuple[Array, Any]:
@@ -72,10 +79,12 @@ class FreeEnergy:
         Keep gradients through the posterior to train recognition parameters.
         num_samples must be a positive, static integer under JIT.
         """
-        observations = self.model._data(observations)
+        assert num_samples >= 1, "num_samples must be >= 1"
+        # observations = self.model._data(observations)
+        # actions = self.model._actions(actions, observations)
 
         prior_chains, factors_nat, posterior = self.get_posterior(
-            params["prior"], params["rec"], observations
+            params["prior"], params["rec"], observations, actions
         )
 
         # sample latents for Monte Carlo estimation of non-linear generative likelihoods
@@ -125,10 +134,10 @@ class FreeEnergy:
 
         return log_likelihood, kl_qp
 
-    def apply(self, prior_params, rec_params, observations):
+    def apply(self, prior_params, rec_params, observations, actions=None):
         """Return the joint Gaussian smoothing posterior as LGChainDistParam.
 
         Parameters have shapes means=(B,T,N), covs=(B,T,N,N), and
         cross_covs=(B,T-1,N,N), oriented as Cov(z_{t+1}, z_t).
         """
-        return self.get_posterior(prior_params, rec_params, observations)[2]
+        return self.get_posterior(prior_params, rec_params, observations, actions)[2]

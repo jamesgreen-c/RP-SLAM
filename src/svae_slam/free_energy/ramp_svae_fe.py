@@ -1,16 +1,4 @@
-"""Hybrid nodewise RAMP free energy with generative reconstruction.
-
-Place this file at ``src/svae_slam/ramp_svae_fe.py``. For each node, replace
-all local observation RPM factors by their generative likelihoods. Keep the
-past/future RPM factors and one KL to the fixed node prior:
-
-    F = log_likelihood + log_Gamma_temporal - kl_qf_temporal - beta * kl_qp.
-
-The observation recognisers still participate in posterior inference and in
-the messages passed to other nodes. They have no direct local RPM loss term.
-At beta=1, this is RAMP's interior bound on the hybrid nodewise free energies,
-with a Monte Carlo estimate of reconstruction. It is not a trajectory ELBO.
-"""
+"""Hybrid nodewise RAMP free energy with generative reconstruction."""
 
 from typing import Any
 
@@ -42,9 +30,10 @@ class FreeEnergy:
             key: Array,
             data: tuple[Array, ...] | Array,
             config: Config,
+            actions: Array | None = None
         ) -> tuple[dict, dict[str, optax.OptState], dict[str, optax.GradientTransformation]]:
         self.configure(config)
-        params = self.model.init(key, data, config)
+        params = self.model.init(key, data, config, actions)
         opts = {
             'prior': config.prior.build(),
             'rec': config.recognition.build(),
@@ -53,7 +42,7 @@ class FreeEnergy:
         opt_states = {name: opts[name].init(params[name]) for name in opts}
         return params, opt_states, opts
 
-    def get_posterior(self, prior_params, rec_params, observations):
+    def get_posterior(self, prior_params, rec_params, observations, actions=None):
         """
         Form smoothed and causal Gaussian node marginals from message sums.
 
@@ -77,7 +66,7 @@ class FreeEnergy:
         """
         # apply recognition to data to get factors over latent nodes. Apply BP to find messages.
         factors_nat = self.model.get_rec_factors(rec_params, observations)
-        messages = self.model.get_messages(prior_params, factors_nat)
+        messages = self.model.get_messages(prior_params, factors_nat, actions)
         
         # calculate posterior 
         prior = self.model.prior
@@ -87,8 +76,9 @@ class FreeEnergy:
     def loss(
             self,
             params: dict,
-            observations: tuple[Array, ...] | Array,
             key: Array,
+            observations: tuple[Array, ...] | Array,
+            actions: Array | None = None,
             beta: float = 1.0,
             num_samples: int = 1,
             em: bool = False,
@@ -98,8 +88,10 @@ class FreeEnergy:
             raise ValueError('num_samples must be a positive, static integer.')
         
         # calculate posterior
-        observations = self.model._data(observations)
-        prior, messages, posterior = self.get_posterior(params['prior'], params['rec'], observations)
+        # observations = self.model._data(observations)
+        prior, messages, posterior = self.get_posterior(
+            params['prior'], params['rec'], observations, actions
+        )
         posterior = lax.cond(em, lax.stop_gradient, lambda q: q, posterior)
 
         # sample latents for Monte Carlo estimation of non-linear generative likelihoods
@@ -246,6 +238,6 @@ class FreeEnergy:
         kl_qf, log_Gamma = vmap(factor_terms)(messages)
         return kl_qf.sum(), log_Gamma.sum(), kl_qp.sum()
 
-    def apply(self, prior_params, rec_params, observations):
+    def apply(self, prior_params, rec_params, observations, actions=None):
         """Return RAMP's smoothed Gaussian node marginals."""
-        return self.get_posterior(prior_params, rec_params, observations)[2]
+        return self.get_posterior(prior_params, rec_params, observations, actions)[2]

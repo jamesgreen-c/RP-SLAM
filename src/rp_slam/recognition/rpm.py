@@ -10,7 +10,6 @@ from jax import vmap, Array
 from src.distmaps import DistMap
 from src.rp_slam.config import Config
 from src.distributions import LGStationaryParam, AllParams, NetworkParams
-from src.utils.kalman import parallel_filter
 
 
 INITIALIZER = jax.nn.initializers.variance_scaling(
@@ -78,6 +77,31 @@ class RPSSM:
         
         return data
 
+    def _actions(self, actions, data):
+        """Validate actions or return one None per observation sequence.
+
+        data is the tuple returned by _data().
+        Actions have shape (N, T - 1, action_dim).
+        """
+        num_samples, num_timesteps = data[0].shape[:2]
+
+        if actions is None:
+            if self.prior.action_conditioned:
+                raise ValueError("Actions are required when action conditioning is enabled.")
+            return None
+
+        if not self.prior.action_conditioned:
+            raise ValueError("Actions were supplied, but action conditioning is disabled.")
+
+        actions = jnp.asarray(actions)
+        action_dim = self.prior.params["B"].shape[-1]
+        expected_shape = (num_samples, num_timesteps - 1, action_dim)
+
+        if actions.shape != expected_shape:
+            raise ValueError(f"Expected actions with shape {expected_shape}, got {actions.shape}.")
+        
+        return actions
+    
     def get_prior(self, prior_params):
         """Construct the linear-Gaussian prior from its learnable parameters."""
         return self.prior.update(prior_params)
@@ -86,7 +110,8 @@ class RPSSM:
             self,
             key: Array,
             data: tuple[Array] | Array,
-            config: Config
+            config: Config,
+            actions: Array | None = None
         ) -> AllParams:
         data = self._data(data)
         prior_key, *rec_keys = jr.split(key, len(data) + 1)

@@ -47,23 +47,32 @@ class Trainer:
             params: AllParams,
             opt_states: dict[str, optax.OptState],
             data: tuple[Array, ...] | Array,
+            actions: Array | None = None,
     ) -> tuple[AllParams, dict[str, optax.OptState], Array]: 
         model_params, model_opt_states, model_loss = self._update_model(
             itr,
             params,
             opt_states,
-            data
+            data,
+            actions
         )
         new_params = {**params, **model_params}
         new_opt_states = {**opt_states, **model_opt_states}
         return new_params, new_opt_states, model_loss
     
-    def fit(self, data: tuple[Array, ...] | Array, use_pbar: bool = True, y: Array | None = None) -> None:
+    def fit(
+            self, 
+            data: tuple[Array, ...] | Array,
+            actions: Array | None = None, 
+            use_pbar: bool = True, 
+            y: Array | None = None
+        ) -> None:
         """Fit observation sequences; optionally record latent regression R²."""
         data = self.model.model._data(data)
+        actions = self.model.model._actions(actions, data)
 
         key, init_key = jr.split(jr.PRNGKey(self.config.seed))
-        self.params, self.opt_states, self.opts = self.init(init_key, data)
+        self.params, self.opt_states, self.opts = self.init(init_key, data, actions)
 
         train_step = jax.jit(self.train_step) if self.config.jit else self.train_step
 
@@ -81,39 +90,48 @@ class Trainer:
                 batch_indices = np.arange(self.config.batch_size)
             else:
                 batch_indices = jr.randint(subkey, (self.config.batch_size,), 0, data[0].shape[0])
-            batch = [d[batch_indices] for d in data]
 
-            self.params, self.opt_states, loss = train_step(self.itr, self.params, self.opt_states, batch)
+            batch = [d[batch_indices] for d in data]
+            batch_actions = None if actions is None else actions[batch_indices]
+
+            self.params, self.opt_states, loss = train_step(
+                self.itr, self.params, self.opt_states, batch, batch_actions
+            )
             self._stabilise_params()
             
             self.loss_tot.append(loss)
             pbar.set_postfix(loss=float(loss))
 
             if y is not None and self.itr % 100 == 0:
-                _posterior = self.apply(data)
+                _posterior = self.apply(data, actions=actions)
                 name = 'mean' if 'mean' in _posterior.params else 'means'
                 x = _posterior.params[name]
                 r2 = linear_r2(x, y)
                 self.r2_history.append(r2)
 
 
-    def init(self, key: PRNGKey, initial_batch: tuple[Array, ...] | Array):
+    def init(self, key: PRNGKey, data: tuple[Array, ...] | Array, actions: Array | None = None):
         """Initialise model parameters and optimiser states from observations."""
         params, opt_states, opts = self.model.init(
             key, 
-            initial_batch,
-            self.config
+            data,
+            self.config,
+            actions=actions
         )
         return params, opt_states, opts
     
-    def _update_model(self, itr: int, params, opt_states, data):
+    def _update_model(self, itr: int, params, opt_states, data, actions=None):
         """Update prior/message and recognition parameters using the model loss."""
 
         beta = self.config.beta_schedule(itr)
         em = self.config.em
 
         _params = {"prior": params["prior"], "rpm": params["rpm"]}
-        (loss, aux), grads = jax.value_and_grad(self.model.loss, has_aux=True)(_params, data, beta=beta, em=em)
+        (loss, aux), grads = jax.value_and_grad(self.model.loss, has_aux=True)(_params, 
+                                                                               data, 
+                                                                               actions=actions,
+                                                                               beta=beta, 
+                                                                               em=em)
 
         new_params = {}
         new_opt_states = {}
@@ -123,14 +141,19 @@ class Trainer:
         return new_params, new_opt_states, loss
 
 
-    def apply(self, data: tuple[Array, ...] | Array):
+    def apply(self, data: tuple[Array, ...] | Array, actions: Array | None = None):
         """Return the model's smoothing posterior for observation sequences.
 
         RAMPSSM returns GaussianDistParam node marginals (mean, cov).
         RPSSM returns LGChainDistParam (means, covs, cross_covs).
         Both retain the leading batch and time axes.
         """
-        return self.model.apply(self.params["prior"], self.params["rpm"], data)
+        return self.model.apply(
+            self.params["prior"], 
+            self.params["rpm"], 
+            data,
+            actions
+        )
 
     def _stabilise_params(self):
         """Apply the configured singular-value constraint to RPSSM dynamics."""

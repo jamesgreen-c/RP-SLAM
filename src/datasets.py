@@ -7,15 +7,17 @@ from jax import Array
 from pathlib import Path
 
 
-ROOT_DIR = '/ceph/scratch/samoh/experiments/ramp'
+ROOT_DIR = '/'
 
 
 @dataclass
 class Dataset:
     train_data: tuple[Array, ...]
     train_states: Array
+    train_controls: Array
     val_data: tuple[Array, ...]
     val_states: Array
+    val_controls: Array
     params: dict[str, Array]
 
     # TODO: standardizing over the correct axes?
@@ -29,8 +31,10 @@ class Dataset:
         return Dataset(
             train_data=scaled_train_data,
             train_states=self.train_states,
+            train_controls=self.train_controls,
             val_data=scaled_val_data,
             val_states=self.val_states,
+            val_controls=self.val_controls,
             params=self.params
         )
 
@@ -44,8 +48,10 @@ class Dataset:
         return Dataset(
             train_data=train_data,
             train_states=self.train_states,
+            train_controls=self.train_controls,
             val_data=val_data,
             val_states=self.val_states,
+            val_controls=self.val_controls,
             params=self.params
         )
 
@@ -54,8 +60,10 @@ class Dataset:
         return Dataset(
             train_data=tuple(x[index] for x in self.train_data),
             train_states=self.train_states[index],
+            train_controls=self.train_controls[index],
             val_data=tuple(x[index] for x in self.val_data),     
             val_states=self.val_states[index],
+            val_controls=self.val_controls[index],
             params=self.params
         )
         
@@ -74,21 +82,26 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
 
     elif name == 'gps':
             
-            BASE_DIR = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "slam" / "data").is_dir())
-            data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
+        BASE_DIR = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "slam" / "data").is_dir())
+        data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
     
-            latents = np.load(os.path.join(data_dir, "latents.npy"))
+        latents = np.load(os.path.join(data_dir, "latents.npy"))
 
-            observations = latents[:, :, :2]
-            observations += 0.1 * jr.normal(key, shape=observations.shape)
-    
-            return Dataset(
-                train_data=(observations[:200], ),
-                train_states=latents[:200],
-                val_data=(observations[200:], ),
-                val_states=latents[200:],
-                params=None
-            )
+        # saved control t+1 describes the transition from state t to t+1.
+        controls = np.load(os.path.join(data_dir, "controls.npy"))[:, 1:]
+
+        observations = latents[:, :, :2]
+        observations += 0.1 * jr.normal(key, shape=observations.shape)
+
+        return Dataset(
+            train_data=(observations[:200], ),
+            train_states=latents[:200],
+            train_controls=controls[:200],
+            val_data=(observations[200:], ),
+            val_states=latents[200:],
+            val_controls=controls[200:],
+            params=None
+        )
     
     elif name == 'sensor':
         
@@ -96,13 +109,19 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
         data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
 
         latents = np.load(os.path.join(data_dir, "latents.npy"))
+
+        # saved control t+1 describes the transition from state t to t+1.
+        controls = np.load(os.path.join(data_dir, "controls.npy"))[:, 1:]
+
         observations = np.load(os.path.join(data_dir, "sensor.npy"))
 
         return Dataset(
             train_data=(observations[:200], ),
             train_states=latents[:200],
+            train_controls=controls[:200],
             val_data=(observations[200:], ),
             val_states=latents[200:],
+            val_controls=controls[200:],
             params=None
         )
     
@@ -112,13 +131,18 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
         data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
 
         latents = np.load(os.path.join(data_dir, "latents.npy"))
+
+        # saved control t+1 describes the transition from state t to t+1.
+        controls = np.load(os.path.join(data_dir, "controls.npy"))[:, 1:]
         observations = np.load(os.path.join(data_dir, "radar.npy"))
 
         return Dataset(
             train_data=(observations[:200], ),
             train_states=latents[:200],
+            train_controls=controls[:200],
             val_data=(observations[200:], ),
             val_states=latents[200:],
+            val_controls=controls[200:],
             params=None
         )
     
@@ -128,6 +152,9 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
         data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
 
         latents = np.load(os.path.join(data_dir, "latents.npy"))
+
+        # saved control t+1 describes the transition from state t to t+1.
+        controls = np.load(os.path.join(data_dir, "controls.npy"))[:, 1:]
         observations = np.load(os.path.join(data_dir, "images.npy")).astype(np.float32) / 255.0
         # print(observations.shape)
         observations = observations[:, :, 18:42, :]
@@ -135,8 +162,10 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
         return Dataset(
             train_data=(observations[:200], ),
             train_states=latents[:200],
+            train_controls=controls[:200],
             val_data=(observations[200:], ),
             val_states=latents[200:],
+            val_controls=controls[200:],
             params=None
         )
     
@@ -146,14 +175,19 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
         data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
 
         latents = np.load(os.path.join(data_dir, "latents.npy"))
+
+        # saved control t+1 describes the transition from state t to t+1.
+        controls = np.load(os.path.join(data_dir, "controls.npy"))[:, 1:]
         observations = np.load(os.path.join(data_dir, "greyscale_images.npy")).astype(np.float32) / 255.0
         observations = observations[:, :, 18:42, :]
 
         return Dataset(
             train_data=(observations[:200], ),
             train_states=latents[:200],
+            train_controls=controls[:200],
             val_data=(observations[200:], ),
             val_states=latents[200:],
+            val_controls=controls[200:],
             params=None
         )
 
@@ -163,31 +197,41 @@ def load_dataset(name: str, seed: int, datadir: str = ROOT_DIR) -> Dataset:
         data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
 
         latents = np.load(os.path.join(data_dir, "latents.npy"))
+
+        # saved control t+1 describes the transition from state t to t+1.
+        controls = np.load(os.path.join(data_dir, "controls.npy"))[:, 1:]
         observations = np.load(os.path.join(data_dir, "corrupted_greyscale_images.npy")).astype(np.float32) / 255.0
         observations = observations[:, :, 18:42, :]
 
         return Dataset(
             train_data=(observations[:200], ),
             train_states=latents[:200],
+            train_controls=controls[:200],
             val_data=(observations[200:], ),
             val_states=latents[200:],
+            val_controls=controls[200:],
             params=None
         )
 
     elif name == 'uninformative':
-            
+
         BASE_DIR = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "slam" / "data").is_dir())
         data_dir = BASE_DIR / "experiments" / "slam" / "data" / "files"
 
         latents = np.load(os.path.join(data_dir, "latents.npy"))
+
+        # saved control t+1 describes the transition from state t to t+1.
+        controls = np.load(os.path.join(data_dir, "controls.npy"))[:, 1:]
         observations = np.load(os.path.join(data_dir, "uninformative_greyscale_images.npy")).astype(np.float32) / 255.0
         observations = observations[:, :, 18:42, :]
 
         return Dataset(
             train_data=(observations[:200], ),
             train_states=latents[:200],
+            train_controls=controls[:200],
             val_data=(observations[200:], ),
             val_states=latents[200:],
+            val_controls=controls[200:],
             params=None
         )
 

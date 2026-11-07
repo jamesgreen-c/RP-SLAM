@@ -27,14 +27,20 @@ class ConstrainedIVFreeEnergy:
         self.batch_size = config.batch_size
         self.num_factors = len(self.model.recognition) + 2
 
-    def init(self, key: Array, data: tuple[Array, ...] | Array, config: Config):
+    def init(
+            self, 
+            key: Array, 
+            data: tuple[Array, ...] | Array, 
+            config: Config, 
+            actions: Array | None = None
+        ):
         self.configure(config)
-        params = self.model.init(key, data, config)
+        params = self.model.init(key, data, config, actions)
         opts = {'prior': config.prior.build(), 'rpm': config.recognition.build()}
         opt_states = {name: opts[name].init(params[name]) for name in opts}
         return params, opt_states, opts
 
-    def get_posterior(self, prior_params, rec_params, observations):
+    def get_posterior(self, prior_params, rec_params, observations, actions=None):
         """
         Form smoothed and causal Gaussian node marginals from message sums.
 
@@ -58,7 +64,7 @@ class ConstrainedIVFreeEnergy:
         """
         # apply recognition to data to get factors over latent nodes. Apply BP to find messages.
         factors_nat = self.model.get_factors(rec_params, observations)
-        messages = self.model.get_messages(prior_params, factors_nat)
+        messages = self.model.get_messages(prior_params, factors_nat, actions)
 
         # calculate posterior 
         prior = self.model.prior
@@ -69,12 +75,13 @@ class ConstrainedIVFreeEnergy:
             self, 
             params: dict, 
             observations: tuple[Array, ...] | Array, 
+            actions: Array | None = None,
             beta: float = 1.0, 
             em: bool = False, 
         ) -> tuple[Array, Any]:
         
         prior, messages, posterior = self.get_posterior(
-            params['prior'], params['rpm'], observations
+            params['prior'], params['rpm'], observations, actions
         )
 
         # In EM mode hold the E-step belief fixed, but still train the messages.
@@ -166,11 +173,11 @@ class ConstrainedIVFreeEnergy:
         return kl_qf.sum(), log_Gamma.sum(), kl_qp.sum()
 
 
-    def apply(self, prior_params, rec_params, observations):
+    def apply(self, prior_params, rec_params, observations, actions=None):
         """Return smoothed Gaussian node marginals for the observations.
 
         Returns GaussianDistParam with mean=(B,T,N) and cov=(B,T,N,N).
         These are node marginals, not a joint trajectory distribution.
         Use get_posterior(...)[3] for the causal filtered marginals.
         """
-        return self.get_posterior(prior_params, rec_params, observations)[2]
+        return self.get_posterior(prior_params, rec_params, observations, actions)[2]
